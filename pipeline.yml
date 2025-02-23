@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Data pipeline with Step Functions orchestrating Lambda functions to process data from S3 to OpenSearch.
+
+Resources:
+  # S3 Bucket for Raw Sensor Data
+  SensorDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub sensor-data-bucket-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldData
+            Status: Enabled
+            ExpirationInDays: 30  # Delete data older than 30 days
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsLambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: "*"
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaS3OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SensorDataBucket.Arn
+                  - !Sub ${SensorDataBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/sensor-data-domain/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # Lambda Functions for Each Step
+  GetDataFromS3Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetDataFromS3Lambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          s3 = boto3.client('s3')
+          def handler(event, context):
+              bucket = event['bucket']
+              key = event['key']
+              response = s3.get_object(Bucket=bucket, Key=key)
+              data = json.loads(response['Body'].read().decode('utf-8'))
+              return {
+                  'statusCode': 200,
+                  'data': data
+              }
+      Runtime: python3.9
+      Timeout: 300
+
+  CleanAndValidateDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CleanAndValidateDataLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import pandas as pd
+          def handler(event, context):
+              data = event['data']
+              df = pd.DataFrame(data)
+              df = df[(df['temperature'] >= -20) & (df['temperature'] <= 50)]
+              df = df[(df['humidity'] >= 0) & (df['humidity'] <= 100)]
+              df = df.fillna(method='ffill')
+              return {
+                  'statusCode': 200,
+                  'cleaned_data': df.to_dict('records')
+              }
+      Runtime: python3.9
+      Timeout: 300
+
+  TransformDataLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TransformDataLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import pandas as pd
+          def handler(event, context):
+              df = pd.DataFrame(event['cleaned_data'])
+              df['timestamp'] = pd.to_datetime(df['timestamp'])
+              df.set_index('timestamp', inplace=True)
+              df.fillna(method='ffill', inplace=True)  
+              df.interpolate(method='linear', inplace=True)  
+              df = df[(df['temperature'].between(-50, 60)) & (df['humidity'].between(0, 100))]
+              daily_stats = df.resample('D').agg(['mean', 'min', 'max', 'std'])
+              daily_stats.columns = [f"{col[0]}_{col[1]}" for col in daily_stats.columns]
+              bins = [-float('inf'), 0, 20, 30, float('inf')]
+              labels = ["Cold", "Cool", "Warm", "Hot"]
+              daily_stats['temperature_category'] = pd.cut(daily_stats['temperature_mean'], bins=bins, labels=labels)
+              return {
+                  'statusCode': 200,
+                  'transformed_data': daily_stats.reset_index().to_dict('records')
+              }
+
+
+      Runtime: python3.9
+      Timeout: 300
+
+  IngestDataToOpenSearchLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IngestDataToOpenSearchLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          opensearch = boto3.client('es')
+          def handler(event, context):
+              transformed_data = event['transformed_data']
+              opensearch_endpoint = "opensearch-endpoint"
+              for record in transformed_data:
+                  opensearch.index(
+                      index='sensor-data',
+                      body=record
+                  )
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Data ingested successfully!')
+              }
+      Runtime: python3.9
+      Timeout: 300
+
+  # Step Functions State Machine
+  DataTransformationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: DataTransformationPipeline
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Data transformation pipeline from S3 to OpenSearch",
+          "StartAt": "GetDataFromS3",
+          "States": {
+            "GetDataFromS3": {
+              "Type": "Task",
+              "Resource": "${GetDataFromS3Lambda.Arn}",
+              "Next": "CleanAndValidateData"
+            },
+            "CleanAndValidateData": {
+              "Type": "Task",
+              "Resource": "${CleanAndValidateDataLambda.Arn}",
+              "Next": "TransformData"
+            },
+            "TransformData": {
+              "Type": "Task",
+              "Resource": "${TransformDataLambda.Arn}",
+              "Next": "IngestDataToOpenSearch"
+            },
+            "IngestDataToOpenSearch": {
+              "Type": "Task",
+              "Resource": "${IngestDataToOpenSearchLambda.Arn}",
+              "End": true
+            }
+          }
+        }
+
+  # S3 Event Trigger for Step Functions
+  S3EventTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - !Ref SensorDataBucket
+      State: ENABLED
+      Targets:
+        - Id: StepFunctionsTarget
+          Arn: !Ref DataTransformationStateMachine
+          RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+
+Outputs:
+  SensorDataBucketName:
+    Description: S3 Bucket Name for Sensor Data
+    Value: !Ref SensorDataBucket
+  DataTransformationStateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref DataTransformationStateMachine
